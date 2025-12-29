@@ -1,0 +1,464 @@
+---
+title: "Deconvolution Methods Comparison: Robustness Tests"
+author: "Sungryeol Park"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 6)
+```
+
+# 목적
+
+이전 분석(02.Deconvolution.Rmd)에서는 이상적인 조건에서 4가지 deconvolution 방법을 비교했습니다. 하지만 현실적인 조건(높은 노이즈, outlier, missing genes 등)에서는 방법론 간 차이가 더 명확하게 드러납니다.
+
+**이번 분석의 목표:**
+- 5가지 도전적 시나리오에서 각 방법의 **robustness** 비교
+- 각 방법의 장단점을 명확히 파악
+
+# 1. 라이브러리 및 데이터 로드
+
+```{r libraries}
+# 필요한 패키지 설치
+if (!require("nnls")) install.packages("nnls")
+if (!require("quadprog")) install.packages("quadprog")
+if (!require("MASS")) install.packages("MASS")
+if (!require("tidyr")) install.packages("tidyr")
+
+library(nnls)      
+library(quadprog)  
+library(MASS)      
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+```
+
+```{r load-data}
+# Signature Matrix 로드
+signature_matrix <- readRDS("NSCLC_signature_matrix.rds")
+
+cat("Signature matrix:\n")
+cat("- Cell types:", colnames(signature_matrix), "\n")
+cat("- Genes:", nrow(signature_matrix), "\n")
+```
+
+# 2. Deconvolution 방법 구현
+
+```{r methods}
+# Method 1: NNLS
+deconvolve_nnls <- function(bulk, signature) {
+  common_genes <- intersect(names(bulk), rownames(signature))
+  if (length(common_genes) == 0) stop("No common genes")
+  
+  bulk <- bulk[common_genes]
+  signature <- signature[common_genes, ]
+  
+  fit <- nnls(A = as.matrix(signature), b = bulk)
+  prop <- coef(fit)
+  prop <- prop / sum(prop)
+  names(prop) <- colnames(signature)
+  
+  return(prop)
+}
+
+# Method 2: QP
+deconvolve_qp <- function(bulk, signature) {
+  common_genes <- intersect(names(bulk), rownames(signature))
+  bulk <- bulk[common_genes]
+  signature <- signature[common_genes, ]
+  
+  n_types <- ncol(signature)
+  Dmat <- t(signature) %*% signature
+  dvec <- t(signature) %*% bulk
+  Amat <- cbind(rep(1, n_types), diag(n_types))
+  bvec <- c(1, rep(0, n_types))
+  
+  result <- solve.QP(Dmat, dvec, Amat, bvec, meq = 1)
+  prop <- result$solution
+  names(prop) <- colnames(signature)
+  
+  return(prop)
+}
+
+# Method 3: Robust
+deconvolve_robust <- function(bulk, signature) {
+  common_genes <- intersect(names(bulk), rownames(signature))
+  bulk <- bulk[common_genes]
+  signature <- signature[common_genes, ]
+  
+  sig_mat <- as.matrix(signature)
+  fit <- rlm(bulk ~ sig_mat - 1, maxit = 100)
+  
+  prop <- coef(fit)
+  prop[prop < 0] <- 0
+  prop <- prop / sum(prop)
+  names(prop) <- colnames(signature)
+  
+  return(prop)
+}
+
+# Method 4: OLS
+deconvolve_ols <- function(bulk, signature) {
+  common_genes <- intersect(names(bulk), rownames(signature))
+  bulk <- bulk[common_genes]
+  signature <- signature[common_genes, ]
+  
+  sig_mat <- as.matrix(signature)
+  fit <- lm(bulk ~ sig_mat - 1)
+  
+  prop <- coef(fit)
+  prop[prop < 0] <- 0
+  prop <- prop / sum(prop)
+  names(prop) <- colnames(signature)
+  
+  return(prop)
+}
+
+# 비교 함수
+compare_methods <- function(bulk, signature, true_prop) {
+  prop_nnls <- deconvolve_nnls(bulk, signature)
+  prop_qp <- deconvolve_qp(bulk, signature)
+  prop_robust <- deconvolve_robust(bulk, signature)
+  prop_ols <- deconvolve_ols(bulk, signature)
+  
+  results <- data.frame(
+    Method = c("NNLS", "QP", "Robust", "OLS"),
+    Cancer = c(prop_nnls["Cancer"], prop_qp["Cancer"], 
+               prop_robust["Cancer"], prop_ols["Cancer"]),
+    Immune = c(prop_nnls["Immune"], prop_qp["Immune"], 
+               prop_robust["Immune"], prop_ols["Immune"]),
+    Stroma = c(prop_nnls["Stroma"], prop_qp["Stroma"], 
+               prop_robust["Stroma"], prop_ols["Stroma"])
+  )
+  
+  results$Error_Cancer <- abs(results$Cancer - true_prop["Cancer"])
+  results$Error_Immune <- abs(results$Immune - true_prop["Immune"])
+  results$Error_Stroma <- abs(results$Stroma - true_prop["Stroma"])
+  results$Mean_Error <- rowMeans(results[, c("Error_Cancer", "Error_Immune", "Error_Stroma")], na.rm = TRUE)
+  
+  return(results)
+}
+
+cat("함수 구현 완료\n")
+```
+
+# 3. Baseline 토이 샘플
+
+```{r baseline-sample}
+set.seed(123)
+
+# 기본 비율
+toy_proportion <- c(Cancer = 0.5, Immune = 0.3, Stroma = 0.2)
+names(toy_proportion) <- c("Cancer", "Immune", "Stroma")
+
+# 이상적 조건 bulk 생성
+baseline_bulk <- as.matrix(signature_matrix) %*% toy_proportion
+noise_level <- 0.1
+baseline_bulk <- baseline_bulk + rnorm(length(baseline_bulk), 0, noise_level * mean(baseline_bulk))
+baseline_bulk[baseline_bulk < 0] <- 0
+baseline_bulk_vec <- as.numeric(baseline_bulk)
+names(baseline_bulk_vec) <- rownames(signature_matrix)
+
+# Baseline 비교
+baseline_result <- compare_methods(baseline_bulk_vec, as.matrix(signature_matrix), toy_proportion)
+baseline_result$Condition <- "Baseline"
+
+cat("=== Baseline 결과 ===\n")
+print(baseline_result)
+```
+
+# 4. Test 1: 노이즈 레벨 증가
+
+```{r test-noise}
+test_noise_levels <- function(proportions, signature, noise_levels = c(0.1, 0.3, 0.5, 0.7)) {
+  
+  results_list <- list()
+  
+  for (noise in noise_levels) {
+    # Bulk 생성
+    bulk <- as.matrix(signature) %*% proportions
+    bulk <- bulk + matrix(
+      rnorm(prod(dim(bulk)), mean = 0, sd = noise * mean(bulk)),
+      nrow = nrow(bulk)
+    )
+    bulk[bulk < 0] <- 0
+    
+    # 디컨볼루션
+    bulk_vec <- as.numeric(bulk)
+    names(bulk_vec) <- rownames(bulk)
+    
+    comp <- compare_methods(bulk_vec, signature, proportions)
+    comp$Noise_Level <- noise
+    
+    results_list[[paste0("noise_", noise)]] <- comp
+  }
+  
+  return(do.call(rbind, results_list))
+}
+
+# 실행
+noise_results <- test_noise_levels(toy_proportion, as.matrix(signature_matrix))
+
+cat("=== 노이즈 테스트 결과 ===\n")
+print(noise_results)
+
+# Plot
+ggplot(noise_results, aes(x = Noise_Level, y = Mean_Error, color = Method, group = Method)) +
+  geom_line(size = 1.5) +
+  geom_point(size = 3) +
+  labs(title = "Test 1: Method Robustness to Noise",
+       x = "Noise Level (SD as % of mean expression)",
+       y = "Mean Absolute Error") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+```
+
+# 5. Test 2: Outlier 유전자
+
+```{r test-outliers}
+test_with_outliers <- function(bulk, signature, true_prop, n_outliers = 100) {
+  
+  # 랜덤 유전자에 extreme value
+  outlier_genes <- sample(1:length(bulk), n_outliers)
+  bulk_outlier <- bulk
+  bulk_outlier[outlier_genes] <- bulk_outlier[outlier_genes] * 10  # 10배 증폭
+  
+  comp <- compare_methods(bulk_outlier, signature, true_prop)
+  comp$Condition <- "With_Outliers"
+  
+  return(comp)
+}
+
+# 비교
+normal_result <- compare_methods(baseline_bulk_vec, as.matrix(signature_matrix), toy_proportion)
+normal_result$Condition <- "Normal"
+
+outlier_result <- test_with_outliers(baseline_bulk_vec, as.matrix(signature_matrix), toy_proportion, n_outliers = 100)
+
+comparison_outlier <- rbind(normal_result, outlier_result)
+
+cat("=== Outlier 테스트 결과 ===\n")
+print(comparison_outlier)
+
+# Plot
+ggplot(comparison_outlier, aes(x = Method, y = Mean_Error, fill = Condition)) +
+  geom_col(position = "dodge") +
+  labs(title = "Test 2: Impact of Outlier Genes",
+       subtitle = "100 genes amplified 10x",
+       y = "Mean Absolute Error") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+```
+
+# 6. Test 3: Missing Genes
+
+```{r test-missing}
+test_missing_genes <- function(bulk, signature, true_prop, missing_ratio = 0.3) {
+  
+  # 랜덤하게 유전자 제거
+  keep_genes <- sample(1:length(bulk), size = round(length(bulk) * (1 - missing_ratio)))
+  
+  bulk_subset <- bulk[keep_genes]
+  sig_subset <- signature[keep_genes, ]
+  
+  comp <- compare_methods(bulk_subset, sig_subset, true_prop)
+  comp$Missing_Ratio <- missing_ratio
+  
+  return(comp)
+}
+
+# 여러 비율 테스트
+missing_results <- lapply(c(0, 0.2, 0.4, 0.6), function(ratio) {
+  test_missing_genes(baseline_bulk_vec, as.matrix(signature_matrix), toy_proportion, ratio)
+}) %>% do.call(rbind, .)
+
+cat("=== Missing genes 테스트 결과 ===\n")
+print(missing_results)
+
+# Plot
+ggplot(missing_results, aes(x = Missing_Ratio, y = Mean_Error, 
+                             color = Method, group = Method)) +
+  geom_line(size = 1.5) +
+  geom_point(size = 3) +
+  labs(title = "Test 3: Robustness to Missing Genes",
+       x = "Proportion of Missing Genes",
+       y = "Mean Absolute Error") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+```
+
+# 7. Test 4: Batch Effect
+
+```{r test-batch}
+test_batch_effect <- function(bulk, signature, true_prop, batch_strength = 0.5) {
+  
+  # 일부 유전자에 systematic bias 추가
+  n_genes <- length(bulk)
+  batch_genes <- sample(1:n_genes, n_genes/2)
+  
+  bulk_batch <- bulk
+  bulk_batch[batch_genes] <- bulk_batch[batch_genes] * (1 + batch_strength)
+  
+  comp <- compare_methods(bulk_batch, signature, true_prop)
+  comp$Batch_Strength <- batch_strength
+  
+  return(comp)
+}
+
+batch_results <- lapply(c(0, 0.2, 0.5, 1.0), function(strength) {
+  test_batch_effect(baseline_bulk_vec, as.matrix(signature_matrix), toy_proportion, strength)
+}) %>% do.call(rbind, .)
+
+cat("=== Batch effect 테스트 결과 ===\n")
+print(batch_results)
+
+# Plot
+ggplot(batch_results, aes(x = Batch_Strength, y = Mean_Error, 
+                          color = Method, group = Method)) +
+  geom_line(size = 1.5) +
+  geom_point(size = 3) +
+  labs(title = "Test 4: Sensitivity to Batch Effects",
+       x = "Batch Effect Strength",
+       y = "Mean Absolute Error") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1")
+```
+
+# 8. Test 5: 극단적 비율
+
+```{r test-extreme}
+# 극단적 비율
+extreme_proportions <- list(
+  Cancer_Dominant = c(Cancer = 0.9, Immune = 0.05, Stroma = 0.05),
+  Immune_Dominant = c(Cancer = 0.05, Immune = 0.9, Stroma = 0.05),
+  Balanced = c(Cancer = 0.33, Immune = 0.34, Stroma = 0.33)
+)
+
+extreme_results <- lapply(names(extreme_proportions), function(scenario) {
+  props <- extreme_proportions[[scenario]]
+  names(props) <- c("Cancer", "Immune", "Stroma")
+  
+  bulk <- as.matrix(signature_matrix) %*% props
+  bulk <- bulk + rnorm(length(bulk), 0, 0.1 * mean(bulk))
+  bulk[bulk < 0] <- 0
+  bulk_vec <- as.numeric(bulk)
+  names(bulk_vec) <- rownames(signature_matrix)
+  
+  comp <- compare_methods(bulk_vec, as.matrix(signature_matrix), props)
+  comp$Scenario <- scenario
+  return(comp)
+}) %>% do.call(rbind, .)
+
+cat("=== 극단적 비율 테스트 결과 ===\n")
+print(extreme_results)
+
+# Plot
+ggplot(extreme_results, aes(x = Scenario, y = Mean_Error, fill = Method)) +
+  geom_col(position = "dodge") +
+  labs(title = "Test 5: Performance with Extreme Proportions",
+       x = "Scenario",
+       y = "Mean Absolute Error") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set1") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 9. 종합 비교
+
+```{r comprehensive-comparison}
+# 모든 테스트 결과 요약 (각 테스트별 평균 오차만 추출)
+all_tests <- rbind(
+  baseline_result %>% dplyr::select(Method, Mean_Error) %>% mutate(Test = "Baseline"),
+  noise_results %>% group_by(Method) %>% 
+    summarise(Mean_Error = mean(Mean_Error, na.rm = TRUE), .groups = "drop") %>% 
+    mutate(Test = "Noise"),
+  comparison_outlier %>% filter(Condition == "With_Outliers") %>% 
+    dplyr::select(Method, Mean_Error) %>% mutate(Test = "Outliers"),
+  missing_results %>% group_by(Method) %>% 
+    summarise(Mean_Error = mean(Mean_Error, na.rm = TRUE), .groups = "drop") %>% 
+    mutate(Test = "Missing"),
+  batch_results %>% group_by(Method) %>% 
+    summarise(Mean_Error = mean(Mean_Error, na.rm = TRUE), .groups = "drop") %>% 
+    mutate(Test = "Batch"),
+  extreme_results %>% group_by(Method) %>% 
+    summarise(Mean_Error = mean(Mean_Error, na.rm = TRUE), .groups = "drop") %>% 
+    mutate(Test = "Extreme")
+)
+
+cat("=== 전체 테스트 요약 ===\n")
+print(all_tests)
+
+# 종합 heatmap
+ggplot(all_tests, aes(x = Test, y = Method, fill = Mean_Error)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Mean_Error, 3)), color = "white", size = 4) +
+  scale_fill_gradient(low = "green", high = "red") +
+  labs(title = "Comprehensive Method Comparison",
+       subtitle = "Mean Absolute Error across all tests",
+       x = "Test Scenario", y = "Method") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 방법별 평균 순위
+method_ranking <- all_tests %>%
+  group_by(Method) %>%
+  summarise(
+    Mean_MAE = mean(Mean_Error, na.rm = TRUE),
+    SD_MAE = sd(Mean_Error, na.rm = TRUE)
+  ) %>%
+  arrange(Mean_MAE)
+
+cat("\n=== 방법별 종합 순위 ===\n")
+print(method_ranking)
+```
+
+# 10. 결론 및 추천
+
+```{r conclusions}
+cat("===== 분석 결론 =====\n\n")
+
+cat("테스트 시나리오:", length(unique(all_tests$Test)), "\n")
+cat("비교 방법:", length(unique(all_tests$Method)), "\n\n")
+
+cat("종합 순위:\n")
+for (i in 1:nrow(method_ranking)) {
+  cat(sprintf("%d. %s (MAE = %.4f ± %.4f)\n", 
+              i, 
+              method_ranking$Method[i], 
+              method_ranking$Mean_MAE[i],
+              method_ranking$SD_MAE[i]))
+}
+
+cat("\n추천:\n")
+cat("- 이상적 조건: 모든 방법 유사\n")
+cat("- 노이즈/Outlier 많음: Robust Regression\n")
+cat("- 안정성 중요: NNLS\n")
+cat("- 극단적 비율: QP (constraint 덕분)\n")
+cat("- 빠른 속도: OLS (정확도는 떨어짐)\n")
+```
+
+# 11. 결과 저장
+
+```{r save-results}
+write.csv(all_tests, "deconvolution_robustness_tests.csv", row.names = FALSE)
+write.csv(method_ranking, "method_ranking_summary.csv", row.names = FALSE)
+
+cat("결과 저장 완료:\n")
+cat("- deconvolution_robustness_tests.csv\n")
+cat("- method_ranking_summary.csv\n")
+```
+
+---
+
+**Session Info**
+
+```{r session-info, eval=FALSE}
+sessionInfo()
+```
