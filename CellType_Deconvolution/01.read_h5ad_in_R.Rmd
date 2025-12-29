@@ -1,0 +1,195 @@
+---
+title: "NSCLC Single-Cell RNA-seq 데이터 분석 및 Signature Matrix 생성"
+author: "Sungryeol Park"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 6)
+```
+
+# 1. 라이브러리 로드
+
+필요한 패키지를 로드합니다.
+
+```{r libraries}
+library(Seurat)
+library(hdf5r)
+library(dplyr)
+```
+
+# 2. 데이터 읽기
+
+10X HDF5 형식으로 저장된 single-cell RNA-seq 데이터를 읽어옵니다.
+
+```{r read-data}
+# 10X HDF5 형식으로 읽기
+data <- Read10X_h5("NSCLC_EMTAB6149_expression.h5")
+
+# Seurat object 만들기
+seurat_obj <- CreateSeuratObject(counts = data)
+
+# 확인
+seurat_obj
+dim(seurat_obj)
+```
+
+# 3. 메타데이터 로드 및 확인
+
+Cell에 대한 메타데이터를 로드하고 구조를 확인합니다.
+
+```{r load-metadata}
+metadata <- read.table("NSCLC_EMTAB6149_CellMetainfo_table.tsv",
+                       header = TRUE,
+                       sep = "\t", 
+                       stringsAsFactors = FALSE)
+
+# 메타데이터 확인
+head(metadata)
+```
+
+# 4. 메타데이터와 Seurat 객체 병합
+
+## 4.1 Cell ID 맞추기
+
+Seurat 객체와 메타데이터의 cell ID가 일치하는지 확인하고, 순서를 맞춥니다.
+
+```{r align-cells}
+# Seurat의 cell 이름
+head(colnames(seurat_obj))
+
+# Metadata의 cell 이름  
+head(metadata$Cell)
+
+# 순서 맞추기
+rownames(metadata) <- metadata$Cell
+metadata <- metadata[colnames(seurat_obj), ]
+```
+
+## 4.2 Seurat에 메타데이터 추가
+
+```{r add-metadata}
+seurat_obj <- AddMetaData(
+  seurat_obj, 
+  metadata = metadata
+)
+
+# 확인
+head(seurat_obj@meta.data)
+```
+
+# 5. Cell Type 분포 확인
+
+다양한 cell type annotation의 분포를 확인합니다.
+
+```{r celltype-distribution}
+# Major lineage 분포
+cat("Major lineage 분포:\n")
+table(seurat_obj$Celltype..major.lineage.)
+
+# Malignancy 분포  
+cat("\nMalignancy 분포:\n")
+table(seurat_obj$Celltype..malignancy.)
+
+# Minor lineage 분포
+cat("\nMinor lineage 분포:\n")
+table(seurat_obj$Celltype..minor.lineage.)
+```
+
+# 6. Cell Group 생성
+
+Deconvolution을 위해 3개 그룹(Immune, Stroma, Cancer)으로 단순화합니다.
+
+```{r create-groups}
+seurat_obj$cell_group <- case_when(
+  seurat_obj$Celltype..malignancy. == "Immune cells" ~ "Immune",
+  seurat_obj$Celltype..malignancy. == "Stromal cells" ~ "Stroma",
+  seurat_obj$Celltype..malignancy. == "Malignant cells" ~ "Cancer",
+  seurat_obj$Celltype..malignancy. == "Others" ~ "Stroma",  # Alveolar을 Stroma에
+  TRUE ~ NA_character_
+)
+
+# 확인
+cat("Cell group 분포:\n")
+table(seurat_obj$cell_group)
+```
+
+# 7. 데이터 정규화
+
+Signature matrix 생성 전에 데이터를 log-normalization합니다.
+
+```{r normalize}
+# Log-normalization 수행
+seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+
+cat("정규화 완료!\n")
+```
+
+# 8. Signature Matrix 생성
+
+각 cell group의 평균 발현량을 계산하여 signature matrix를 생성합니다.
+
+```{r create-signature}
+# 각 그룹별 평균 발현량 (Log-normalized data 사용)
+signature_matrix <- AverageExpression(
+  seurat_obj,
+  group.by = "cell_group",
+  slot = "data"
+)$RNA
+
+# 확인
+dim(signature_matrix)
+head(signature_matrix)
+```
+
+# 9. Signature Matrix 저장
+
+생성된 signature matrix를 파일로 저장합니다.
+
+```{r save-signature}
+# CSV 형식으로 저장
+write.csv(signature_matrix, 
+          file = "NSCLC_signature_matrix.csv", 
+          row.names = TRUE)
+
+# RDS 형식으로도 저장 (R에서 빠르게 불러올 수 있음)
+saveRDS(signature_matrix, 
+        file = "NSCLC_signature_matrix.rds")
+
+# TSV 형식으로도 저장 (Python에서 읽기 쉬움)
+write.table(signature_matrix, 
+            file = "NSCLC_signature_matrix.tsv", 
+            sep = "\t", 
+            row.names = TRUE, 
+            col.names = NA, 
+            quote = FALSE)
+
+cat("Signature matrix 저장 완료:\n")
+cat("- NSCLC_signature_matrix.csv\n")
+cat("- NSCLC_signature_matrix.rds\n")
+cat("- NSCLC_signature_matrix.tsv\n")
+```
+
+# 10. 요약
+
+```{r summary}
+cat("분석 완료!\n")
+cat("총 셀 수:", ncol(seurat_obj), "\n")
+cat("총 유전자 수:", nrow(seurat_obj), "\n")
+cat("Cell group 수:", length(unique(seurat_obj$cell_group)), "\n")
+cat("Signature matrix 크기:", nrow(signature_matrix), "x", ncol(signature_matrix), "\n")
+```
+
+---
+
+**Session Info**
+
+```{r session-info}
+sessionInfo()
+```
