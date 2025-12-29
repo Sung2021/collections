@@ -1,0 +1,465 @@
+---
+title: "Deconvolution Analysis with Toy Samples"
+author: "Sungryeol Park"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 6)
+```
+
+# 1. 라이브러리 로드 및 설치
+
+```{r libraries}
+# 필요한 패키지 설치
+if (!require("nnls")) install.packages("nnls")
+if (!require("quadprog")) install.packages("quadprog")
+if (!require("MASS")) install.packages("MASS")
+if (!require("tidyr")) install.packages("tidyr")
+
+library(nnls)      # Non-negative least squares
+library(quadprog)  # Quadratic programming
+library(MASS)      # Robust regression
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+```
+
+# 2. Signature Matrix 로드
+
+이전 단계에서 생성한 signature matrix를 로드합니다.
+
+```{r load-signature}
+# RDS 파일로 로드 (가장 빠름)
+signature_matrix <- readRDS("NSCLC_signature_matrix.rds")
+
+# 또는 CSV로 로드
+# signature_matrix <- read.csv("NSCLC_signature_matrix.csv", row.names = 1)
+
+# 확인
+dim(signature_matrix)
+head(signature_matrix[, 1:3])
+cat("\nCell types:", colnames(signature_matrix), "\n")
+```
+
+# 3. 토이 샘플 생성
+
+Signature matrix를 기반으로 알려진 비율의 토이 bulk RNA-seq 샘플을 생성합니다.
+
+```{r create-toy-samples}
+set.seed(123)
+
+# 토이 샘플 5개 생성 (각각 다른 cell type 비율)
+toy_proportions <- data.frame(
+  Sample1 = c(Cancer = 0.7, Immune = 0.2, Stroma = 0.1),
+  Sample2 = c(Cancer = 0.3, Immune = 0.5, Stroma = 0.2),
+  Sample3 = c(Cancer = 0.1, Immune = 0.3, Stroma = 0.6),
+  Sample4 = c(Cancer = 0.5, Immune = 0.3, Stroma = 0.2),
+  Sample5 = c(Cancer = 0.2, Immune = 0.2, Stroma = 0.6)
+)
+
+cat("실제 Cell Type 비율 (Ground Truth):\n")
+print(toy_proportions)
+
+# Bulk RNA-seq 데이터 생성: signature matrix와 비율을 곱함
+# Y = X * β + noise
+# Y: bulk expression, X: signature matrix, β: proportions
+toy_bulk <- as.matrix(signature_matrix) %*% as.matrix(toy_proportions)
+
+# 약간의 노이즈 추가 (현실적인 시뮬레이션)
+noise_level <- 0.1
+mean_expression <- mean(toy_bulk)
+toy_bulk <- toy_bulk + matrix(
+  rnorm(prod(dim(toy_bulk)), mean = 0, sd = noise_level * mean_expression),
+  nrow = nrow(toy_bulk)
+)
+
+# 음수값 제거
+toy_bulk[toy_bulk < 0] <- 0
+
+cat("\n토이 Bulk RNA-seq 데이터:\n")
+dim(toy_bulk)
+head(toy_bulk)
+```
+
+# 4. Deconvolution 방법 구현
+
+## 4.1 Method 1: NNLS (Non-negative Least Squares)
+
+```{r method-nnls}
+deconvolve_nnls <- function(bulk, signature) {
+  #' @param bulk: 한 샘플의 발현량 (유전자 벡터)
+  #' @param signature: Signature (Gene × Cell type)
+  #' @return: 세포 타입 비율
+  
+  common_genes <- intersect(names(bulk), rownames(signature))
+  
+  if (length(common_genes) == 0) {
+    stop("No common genes found")
+  }
+  
+  bulk <- bulk[common_genes]
+  signature <- signature[common_genes, ]
+  
+  fit <- nnls(A = as.matrix(signature), b = bulk)
+  prop <- coef(fit)
+  prop <- prop / sum(prop)
+  names(prop) <- colnames(signature)
+  
+  return(prop)
+}
+
+cat("NNLS 함수 구현 완료\n")
+```
+
+## 4.2 Method 2: Quadratic Programming
+
+```{r method-qp}
+deconvolve_qp <- function(bulk, signature) {
+  #' Quadratic Programming with sum-to-1 constraint
+  
+  common_genes <- intersect(names(bulk), rownames(signature))
+  bulk <- bulk[common_genes]
+  signature <- signature[common_genes, ]
+  
+  n_types <- ncol(signature)
+  
+  # QP setup: minimize ||signature * prop - bulk||^2
+  Dmat <- t(signature) %*% signature
+  dvec <- t(signature) %*% bulk
+  
+  # Constraints: sum(prop) = 1, prop >= 0
+  Amat <- cbind(rep(1, n_types), diag(n_types))
+  bvec <- c(1, rep(0, n_types))
+  
+  result <- solve.QP(Dmat, dvec, Amat, bvec, meq = 1)
+  
+  prop <- result$solution
+  names(prop) <- colnames(signature)
+  
+  return(prop)
+}
+
+cat("Quadratic Programming 함수 구현 완료\n")
+```
+
+## 4.3 Method 3: Robust Regression
+
+```{r method-robust}
+deconvolve_robust <- function(bulk, signature) {
+  #' Robust linear regression (Huber loss)
+  
+  common_genes <- intersect(names(bulk), rownames(signature))
+  bulk <- bulk[common_genes]
+  signature <- signature[common_genes, ]
+  
+  # Robust linear model
+  sig_mat <- as.matrix(signature)
+  fit <- rlm(bulk ~ sig_mat - 1, maxit = 100)
+  
+  prop <- coef(fit)
+  prop[prop < 0] <- 0
+  prop <- prop / sum(prop)
+  # coefficient 이름 정리
+  names(prop) <- gsub("sig_mat", "", names(prop))
+  names(prop) <- colnames(signature)
+  
+  return(prop)
+}
+
+cat("Robust Regression 함수 구현 완료\n")
+```
+
+## 4.4 Method 4: OLS (Ordinary Least Squares)
+
+```{r method-ols}
+deconvolve_ols <- function(bulk, signature) {
+  #' Baseline OLS regression
+  
+  common_genes <- intersect(names(bulk), rownames(signature))
+  bulk <- bulk[common_genes]
+  signature <- signature[common_genes, ]
+  
+  sig_mat <- as.matrix(signature)
+  fit <- lm(bulk ~ sig_mat - 1)
+  
+  prop <- coef(fit)
+  prop[prop < 0] <- 0
+  prop <- prop / sum(prop)
+  # coefficient 이름 정리
+  names(prop) <- gsub("sig_mat", "", names(prop))
+  names(prop) <- colnames(signature)
+  
+  return(prop)
+}
+
+cat("OLS 함수 구현 완료\n")
+```
+
+# 5. 방법 비교 함수
+
+```{r compare-function}
+# 4가지 방법 비교
+compare_methods <- function(bulk, signature, true_prop = NULL) {
+  
+  # 각 방법 실행
+  prop_nnls <- deconvolve_nnls(bulk, signature)
+  prop_qp <- deconvolve_qp(bulk, signature)
+  prop_robust <- deconvolve_robust(bulk, signature)
+  prop_ols <- deconvolve_ols(bulk, signature)
+  
+  # 디버깅: 각 결과 확인
+  cat("NNLS result:", names(prop_nnls), "\n")
+  cat("QP result:", names(prop_qp), "\n")
+  cat("Robust result:", names(prop_robust), "\n")
+  cat("OLS result:", names(prop_ols), "\n")
+  
+  # Cell type names 확인
+  cell_types <- colnames(signature)
+  cat("Expected cell types:", cell_types, "\n")
+  
+  # 결과 정리
+  results <- data.frame(
+    Method = c("NNLS", "QP", "Robust", "OLS"),
+    Cancer = c(prop_nnls["Cancer"], prop_qp["Cancer"], 
+               prop_robust["Cancer"], prop_ols["Cancer"]),
+    Immune = c(prop_nnls["Immune"], prop_qp["Immune"], 
+               prop_robust["Immune"], prop_ols["Immune"]),
+    Stroma = c(prop_nnls["Stroma"], prop_qp["Stroma"], 
+               prop_robust["Stroma"], prop_ols["Stroma"])
+  )
+  
+  # True proportion 있으면 에러 계산
+  if (!is.null(true_prop)) {
+    cat("True prop names:", names(true_prop), "\n")
+    results$Error_Cancer <- abs(results$Cancer - true_prop["Cancer"])
+    results$Error_Immune <- abs(results$Immune - true_prop["Immune"])
+    results$Error_Stroma <- abs(results$Stroma - true_prop["Stroma"])
+    results$Mean_Error <- rowMeans(results[, c("Error_Cancer", "Error_Immune", "Error_Stroma")], na.rm = TRUE)
+  }
+  
+  return(results)
+}
+
+cat("비교 함수 구현 완료\n")
+```
+
+# 6. 토이 샘플에 대해 비교 실행
+
+```{r run-comparison}
+# 첫 번째 토이 샘플로 비교
+bulk_vec <- toy_bulk[, 1]
+names(bulk_vec) <- rownames(toy_bulk)
+
+# true_prop를 named vector로 만들기
+true_prop <- toy_proportions[, 1]
+names(true_prop) <- rownames(toy_proportions)
+
+# 4가지 방법 비교
+comparison <- compare_methods(
+  bulk = bulk_vec,
+  signature = as.matrix(signature_matrix),
+  true_prop = true_prop
+)
+
+cat("=== 비교 결과 (Sample 1) ===\n\n")
+print(comparison)
+```
+
+# 7. 모든 샘플에 대해 비교
+
+```{r all-samples-comparison}
+# 모든 샘플에 대해 각 방법 실행
+all_results <- lapply(1:ncol(toy_bulk), function(i) {
+  bulk_vec <- toy_bulk[, i]
+  names(bulk_vec) <- rownames(toy_bulk)
+  
+  # true_prop를 named vector로 만들기
+  true_prop_vec <- toy_proportions[, i]
+  names(true_prop_vec) <- rownames(toy_proportions)
+  
+  comp <- compare_methods(
+    bulk = bulk_vec,
+    signature = as.matrix(signature_matrix),
+    true_prop = true_prop_vec
+  )
+  
+  comp$Sample <- colnames(toy_bulk)[i]
+  return(comp)
+})
+
+# 결합
+all_results_df <- do.call(rbind, all_results)
+
+cat("=== 전체 샘플 비교 결과 ===\n\n")
+print(all_results_df)
+
+cat("\n=== 방법별 평균 오차 ===\n")
+all_results_df %>%
+  group_by(Method) %>%
+  summarise(
+    Mean_Error = mean(Mean_Error, na.rm = TRUE),
+    SD_Error = sd(Mean_Error, na.rm = TRUE)
+  ) %>%
+  arrange(Mean_Error) %>%
+  print()
+```
+
+# 8. 결과 시각화
+
+## 8.1 방법별 예측 비율 (Sample 1)
+
+```{r plot-proportions}
+# Sample 1에 대한 비교 (comparison은 Section 6에서 정의됨)
+comp_long <- comparison %>%
+  dplyr::select(Method, Cancer, Immune, Stroma) %>%
+  pivot_longer(cols = c(Cancer, Immune, Stroma),
+               names_to = "CellType",
+               values_to = "Proportion")
+
+# Ground Truth 추가 (toy_proportions에서 직접 가져오기)
+true_long <- data.frame(
+  Method = "GroundTruth",
+  CellType = rownames(toy_proportions),
+  Proportion = as.numeric(toy_proportions[, 1])
+)
+
+comp_long <- rbind(comp_long, true_long)
+
+# Method 순서 지정 (GroundTruth를 맨 앞에)
+comp_long$Method <- factor(comp_long$Method, 
+                            levels = c("GroundTruth", "NNLS", "QP", "Robust", "OLS"))
+
+ggplot(comp_long, aes(x = Method, y = Proportion, fill = CellType)) +
+  geom_col(position = "stack") +
+  labs(title = "Predicted Proportions by Method (Sample 1)",
+       y = "Proportion") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set2")
+```
+
+## 8.2 방법별 평균 오차 (Sample 1)
+
+```{r plot-errors}
+# Ground Truth 제외하고 비교
+comparison_filtered <- comparison %>% filter(Method != "GroundTruth")
+
+ggplot(comparison_filtered, aes(x = reorder(Method, Mean_Error), y = Mean_Error, fill = Method)) +
+  geom_col() +
+  labs(title = "Mean Absolute Error by Method (Sample 1)",
+       x = "Method",
+       y = "Mean Absolute Error") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  scale_fill_brewer(palette = "Set1")
+```
+
+## 8.3 전체 샘플에 대한 오차 분포
+
+```{r plot-all-errors}
+ggplot(all_results_df, aes(x = Method, y = Mean_Error, fill = Method)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  labs(title = "Mean Absolute Error Across All Samples",
+       y = "Mean Absolute Error") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  scale_fill_brewer(palette = "Set1")
+```
+
+## 8.4 Cell Type별 오차
+
+```{r plot-celltype-errors}
+error_long <- all_results_df %>%
+  dplyr::select(Method, Sample, Error_Cancer, Error_Immune, Error_Stroma) %>%
+  pivot_longer(cols = starts_with("Error_"),
+               names_to = "CellType",
+               values_to = "Error") %>%
+  mutate(CellType = gsub("Error_", "", CellType))
+
+ggplot(error_long, aes(x = Method, y = Error, fill = CellType)) +
+  geom_boxplot() +
+  facet_wrap(~ CellType) +
+  labs(title = "Prediction Error by Method and Cell Type",
+       y = "Absolute Error") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set2")
+```
+
+# 9. 실제 Bulk 데이터에 적용 (예시)
+
+실제 bulk RNA-seq 데이터가 있다면 아래 코드로 deconvolution을 수행할 수 있습니다.
+
+```{r real-data-example, eval=FALSE}
+# 예시: CSV 파일에서 bulk RNA-seq 데이터 로드
+# bulk_data <- read.csv("your_bulk_rnaseq_data.csv", row.names = 1)
+
+# 유전자 이름 매칭 (signature matrix와 bulk data의 공통 유전자만 사용)
+# common_genes <- intersect(rownames(signature_matrix), rownames(bulk_data))
+# signature_filtered <- signature_matrix[common_genes, ]
+# bulk_filtered <- bulk_data[common_genes, ]
+
+# 각 방법으로 Deconvolution 실행
+# for (i in 1:ncol(bulk_filtered)) {
+#   bulk_vec <- bulk_filtered[, i]
+#   names(bulk_vec) <- rownames(bulk_filtered)
+#   
+#   results <- compare_methods(bulk_vec, signature_filtered)
+#   print(results)
+# }
+```
+
+# 10. 결과 저장
+
+```{r save-results}
+# 전체 비교 결과 저장
+write.csv(all_results_df, 
+          file = "deconvolution_methods_comparison.csv", 
+          row.names = FALSE)
+
+cat("결과 저장 완료:\n")
+cat("- deconvolution_methods_comparison.csv\n")
+```
+
+# 11. 요약
+
+```{r summary}
+cat("===== Deconvolution 분석 완료! =====\n\n")
+
+cat("사용된 Signature matrix:\n")
+cat("- Cell types:", ncol(signature_matrix), "\n")
+cat("- Genes:", nrow(signature_matrix), "\n\n")
+
+cat("토이 샘플:\n")
+cat("- 샘플 수:", ncol(toy_bulk), "\n\n")
+
+cat("방법별 평균 오차:\n")
+method_summary <- all_results_df %>%
+  group_by(Method) %>%
+  summarise(
+    Mean_Error = mean(Mean_Error, na.rm = TRUE)
+  ) %>%
+  arrange(Mean_Error)
+
+print(method_summary)
+
+cat("\n최적 방법:", method_summary$Method[1], 
+    "(MAE =", round(method_summary$Mean_Error[1], 4), ")\n")
+```
+
+---
+
+**Session Info**
+
+```{r session-info, eval=FALSE}
+sessionInfo()
+```
